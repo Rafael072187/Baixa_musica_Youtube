@@ -11,6 +11,7 @@ Melhorias em relação à versão original:
   * MP4 com escolha de resolução, MP3 com bitrate configurável e M4A;
   * playlist inteira em uma única pasta com o nome da playlist (itens avulsos
     continuam podendo ficar em pastas separadas);
+  * itens indisponíveis em uma playlist são ignorados, sem abortar o restante;
   * aviso claro quando o FFmpeg não está disponível;
   * preferências (modo, qualidade, pasta) salvas entre execuções;
   * registro de mensagens do yt-dlp dentro da própria janela.
@@ -18,6 +19,7 @@ Melhorias em relação à versão original:
 
 from __future__ import annotations
 
+import functools
 import json
 import os
 import queue
@@ -31,10 +33,12 @@ import tkinter as tk
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
+from typing import Any, cast
 from urllib.parse import parse_qs, urlparse
 
 import yt_dlp
 from yt_dlp.postprocessor.ffmpeg import FFmpegPostProcessor
+from yt_dlp.utils import DownloadCancelled, DownloadError
 
 # --------------------------------------------------------------------------- #
 # Constantes
@@ -263,11 +267,22 @@ class DownloadConfig:
     embed_thumbnail: bool
 
 
+@dataclass
+class _DownloadReport:
+    """Coleta falhas e itens concluídos durante um download em lote."""
+
+    errors: list[str] = field(default_factory=list)
+    finished_ids: set[str] = field(default_factory=set)
+
+
 class _QueueLogger:
     """Envia avisos/erros do yt-dlp para a fila consumida pela interface."""
 
-    def __init__(self, events: queue.Queue) -> None:
+    def __init__(
+        self, events: queue.Queue, report: _DownloadReport | None = None
+    ) -> None:
         self._events = events
+        self._report = report
 
     def debug(self, message: str) -> None:  # noqa: D401 - assinatura exigida pelo yt-dlp
         if message.startswith("[debug] "):
@@ -280,7 +295,10 @@ class _QueueLogger:
         self._events.put(("log", f"Aviso: {clean_error(message)}"))
 
     def error(self, message: str) -> None:
-        self._events.put(("log", f"Erro: {clean_error(message)}"))
+        text = clean_error(message)
+        self._events.put(("log", f"Erro: {text}"))
+        if self._report is not None:
+            self._report.errors.append(text)
 
 
 # --------------------------------------------------------------------------- #
@@ -839,7 +857,9 @@ class YTDownloaderApp:
                 if isinstance(widget, ttk.Widget):
                     widget.state(["!disabled"] if enabled else ["disabled"])
                 else:
-                    widget.configure(state="normal" if enabled else "disabled")
+                    cast(Any, widget).configure(
+                        state="normal" if enabled else "disabled"
+                    )
             except tk.TclError:
                 pass
 
@@ -994,39 +1014,65 @@ class YTDownloaderApp:
 
     def _download_worker(self, config: DownloadConfig) -> None:
         """Executa o yt-dlp fora da thread da interface."""
+        report = _DownloadReport()
         try:
-            options = self._build_options(config)
-            with yt_dlp.YoutubeDL(options) as ydl:
+            options = self._build_options(config, report)
+            with yt_dlp.YoutubeDL(cast(Any, options)) as ydl:
                 retcode = ydl.download([config.url])
-            if retcode:
-                self.events.put(
-                    ("error", "O yt-dlp retornou erro ao processar o link.")
-                )
-            else:
-                self.events.put(("done", None))
-        except yt_dlp.utils.DownloadCancelled:
+        except DownloadCancelled:
             self.events.put(("cancelled", None))
-        except yt_dlp.utils.DownloadError as exc:
+            return
+        except DownloadError as exc:
             if self.cancel_event.is_set():
                 self.events.put(("cancelled", None))
             else:
                 self.events.put(("error", clean_error(str(exc))))
+            return
         except Exception as exc:  # noqa: BLE001 - erro inesperado precisa chegar à UI
             self.events.put(("error", f"{type(exc).__name__}: {exc}"))
+            return
 
-    def _build_options(self, config: DownloadConfig) -> dict:
+        batch = config.playlist or is_playlist_url(config.url)
+        if retcode == 0 and not report.errors:
+            self.events.put(("done", None))
+        elif batch and report.finished_ids:
+            # Pelo menos um item foi baixado: os demais estavam indisponíveis.
+            self.events.put(
+                (
+                    "partial",
+                    {
+                        "count": len(report.errors),
+                        "first": report.errors[0],
+                    },
+                )
+            )
+        else:
+            self.events.put(
+                (
+                    "error",
+                    report.errors[0]
+                    if report.errors
+                    else "O yt-dlp retornou erro ao processar o link.",
+                )
+            )
+
+    def _build_options(
+        self, config: DownloadConfig, report: _DownloadReport | None = None
+    ) -> dict:
         folder = Path(config.folder)
         outtmpl = self._output_template(config)
 
         has_ffmpeg = ffmpeg_available()
         postprocessors = self._postprocessors(config)
+        batch = config.playlist or is_playlist_url(config.url)
 
         options: dict = {
             "paths": {"home": str(folder)},
             "outtmpl": {"default": outtmpl},
             "format": self._format_selector(config, has_ffmpeg),
             "noplaylist": not config.playlist,
-            "ignoreerrors": False,
+            # Em lote, itens indisponíveis são ignorados em vez de abortar tudo.
+            "ignoreerrors": batch,
             "retries": 3,
             "fragment_retries": 5,
             "concurrent_fragment_downloads": 4,
@@ -1037,8 +1083,8 @@ class YTDownloaderApp:
             "quiet": True,
             "no_warnings": True,
             "consoletitle": False,
-            "logger": _QueueLogger(self.events),
-            "progress_hooks": [self._progress_hook],
+            "logger": _QueueLogger(self.events, report),
+            "progress_hooks": [functools.partial(self._progress_hook, report=report)],
             "postprocessor_hooks": [self._postprocessor_hook],
         }
 
@@ -1079,6 +1125,7 @@ class YTDownloaderApp:
 
     @staticmethod
     def _postprocessors(config: DownloadConfig) -> list[dict]:
+        processors: list[dict[str, Any]] = []
         if config.mode == "mp3":
             processors = [
                 {
@@ -1101,9 +1148,9 @@ class YTDownloaderApp:
             )
         return processors
 
-    def _progress_hook(self, data: dict) -> None:
+    def _progress_hook(self, data: dict, report: _DownloadReport | None = None) -> None:
         if self.cancel_event.is_set():
-            raise yt_dlp.utils.DownloadCancelled("cancelado pelo usuário")
+            raise DownloadCancelled("cancelado pelo usuário")
 
         status = data.get("status")
         info = data.get("info_dict") or {}
@@ -1127,6 +1174,8 @@ class YTDownloaderApp:
                 )
             )
         elif status == "finished":
+            if report is not None and info.get("id"):
+                report.finished_ids.add(str(info["id"]))
             self.events.put(("progress_finished", info.get("title")))
 
     def _postprocessor_hook(self, data: dict) -> None:
@@ -1165,6 +1214,8 @@ class YTDownloaderApp:
             self._append_log(str(payload))
         elif kind == "done":
             self._finish(success=True)
+        elif kind == "partial":
+            self._finish(success=True, partial=payload)  # type: ignore[arg-type]
         elif kind == "cancelled":
             self._finish(success=None)
         elif kind == "error":
@@ -1195,9 +1246,34 @@ class YTDownloaderApp:
         title = data.get("title")
         self.status_var.set(f"Baixando: {shorten(title)}" if title else "Baixando…")
 
-    def _finish(self, success: bool | None, message: str = "") -> None:
+    def _finish(
+        self,
+        success: bool | None,
+        message: str = "",
+        partial: dict | None = None,
+    ) -> None:
         self._set_indeterminate(False)
         self._set_busy(False)
+
+        if success is True and partial:
+            count = int(partial.get("count") or 0)
+            first = str(partial.get("first") or "")
+            self.progress.configure(value=100)
+            self.pct_var.set("100%")
+            self.status_var.set(f"Concluído com {count} falha(s)")
+            self.detail_var.set(
+                "Itens indisponíveis foram ignorados — veja o registro."
+            )
+            self._append_log(
+                f"Playlist finalizada com {count} item(ns) que não puderam ser baixados."
+            )
+            messagebox.showwarning(
+                "Playlist concluída com avisos",
+                f"{count} item(ns) não puderam ser baixados e foram ignorados.\n\n"
+                f"Primeiro erro: {shorten(first, 180)}\n\n"
+                "A lista completa está no registro da janela.",
+            )
+            return
 
         if success is True:
             self.progress.configure(value=100)

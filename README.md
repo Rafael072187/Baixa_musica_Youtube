@@ -39,9 +39,9 @@
 <details>
 <summary><b>Resumo</b></summary>
 
-O **YT Downloader Pro** é a evolução do script original `musica.py`: o que era um
-programa de terminal virou uma **interface gráfica completa** construída com **Tkinter**,
-usando o **yt-dlp** para extrair e baixar conteúdo do YouTube.
+O **YT Downloader Pro** é a evolução do script original de terminal: o que era um
+programa de linha de comando virou uma **interface gráfica completa** construída com
+**Tkinter**, usando o **yt-dlp** para extrair e baixar conteúdo do YouTube.
 
 O aplicativo permite baixar **vídeo (MP4)** ou **áudio (MP3 / M4A)**, mostra o
 **progresso em tempo real** (porcentagem, tamanho, velocidade e tempo restante),
@@ -74,6 +74,7 @@ entre execuções, então o programa abre já configurado do jeito que você dei
 | 📊 **Progresso real**            | Barra de progresso com porcentagem, bytes baixados, velocidade e ETA.                                     |
 | ⏹️ **Cancelamento**              | Botão **Cancelar** que interrompe o download sem travar a janela.                                         |
 | 📁 **Playlist em uma pasta**     | Com "Baixar playlist inteira" marcado, todos os itens ficam em uma pasta com o nome da playlist.          |
+| 🛡️ **Playlist resiliente**       | Vídeos privados, removidos ou bloqueados são ignorados; o restante continua e o app informa quantos falharam. |
 | 🗂️ **Pasta por vídeo**           | Para itens avulsos, opção de criar uma pasta com o nome do vídeo/música (ativada por padrão).             |
 | 📂 **Pasta de destino**          | Campo editável, seletor de pasta e botão para abrir a pasta no explorador.                                |
 | 💾 **Preferências persistentes** | Formato, qualidade, bitrate, pasta e opções são lembrados na próxima execução.                            |
@@ -87,7 +88,7 @@ entre execuções, então o programa abre já configurado do jeito que você dei
 <details>
 <summary><b>O que mudou em relação à versão anterior</b></summary>
 
-| Antes (`musica.py`)                                              | Agora (`yt_downloader_pro.py`)                    |
+| Antes (versão de terminal)                                       | Agora (versão atual)                              |
 | ---------------------------------------------------------------- | ------------------------------------------------- |
 | Script de terminal                                               | Interface gráfica Tkinter                         |
 | Apenas MP4 (áudio extraído do vídeo)                             | MP4 (vídeo), MP3 e M4A                            |
@@ -96,6 +97,7 @@ entre execuções, então o programa abre já configurado do jeito que você dei
 | Atualizava a interface pela thread de download (risco de travar) | Comunicação por fila + `root.after` (thread-safe) |
 | Pasta fixa na área de trabalho                                   | Pasta configurável (padrão: `Downloads`)          |
 | Playlist criava uma pasta por item                               | Playlist agrupa tudo em uma pasta com o nome dela |
+| Playlist abortava no primeiro vídeo indisponível                 | Itens com erro são ignorados e o restante é baixado |
 | Erros genéricos                                                  | Mensagem real do yt-dlp no registro da janela     |
 | Sem validação de link                                            | Validação e normalização de URLs do YouTube       |
 | Sem checagem de FFmpeg                                           | Detecta o FFmpeg e avisa antes de começar         |
@@ -190,10 +192,10 @@ ffmpeg -version
 ### 1. Execute o aplicativo
 
 ```bash
-python yt_downloader_pro.py
+python musica.py
 ```
 
-> O script antigo `musica.py` foi substituído por `yt_downloader_pro.py`.
+> Esta é a versão com interface gráfica; a versão anterior era executada pelo terminal.
 
 ### 2. Cole o link
 
@@ -360,6 +362,12 @@ novamente. Verifique com `ffmpeg -version`.
 **O MP4 saiu em qualidade baixa**
 Sem FFmpeg o yt-dlp não consegue juntar vídeo e áudio separados, então o app usa
 um formato progressivo. Instale o FFmpeg para liberar 1080p/720p e afins.
+
+**"Video unavailable" ao baixar uma playlist**
+Vídeos privados, removidos ou bloqueados por região são **ignorados automaticamente**
+e o restante da playlist continua. No fim, o app mostra um aviso com a quantidade de
+itens que falharam, e o motivo de cada um fica no **Registro**. Se **todos** os itens
+falharem, atualize o yt-dlp: `pip install -U yt-dlp`.
 
 **Aviso: "No supported JavaScript runtime could be found"**
 É um aviso do próprio yt-dlp. Opcionalmente instale o [Deno](https://deno.com/)
